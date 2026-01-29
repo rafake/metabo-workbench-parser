@@ -227,23 +227,45 @@ def import_finalize(
         sys.exit(1)
 
 
+def _is_uuid(value: str) -> bool:
+    """Check if string is a valid UUID."""
+    try:
+        UUID(value)
+        return True
+    except ValueError:
+        return False
+
+
 @parse_app.command("mwtab")
 def parse_mwtab(
-    file_id: str = typer.Option(..., "--file-id", help="UUID of file to parse"),
+    file_ref: str = typer.Argument(..., help="File ID (UUID) or path to mwTab file"),
     dry_run: bool = typer.Option(False, "--dry-run", help="Don't write to database, only show stats"),
 ):
-    """Parse mwTab file and extract sample factors."""
-    console.print(f"[bold blue]Parsing mwTab file: {file_id}[/bold blue]")
+    """Parse mwTab file and extract samples, features, and measurements.
+
+    FILE_REF can be:
+    - A UUID from the files table (e.g., from 'metaloader ingest-file')
+    - A direct path to an mwTab file
+    """
+    console.print(f"[bold blue]Parsing mwTab: {file_ref}[/bold blue]")
 
     if dry_run:
         console.print("[bold yellow]⚠ Dry run mode - not writing to database[/bold yellow]")
 
-    try:
-        # Parse UUID
-        file_uuid = UUID(file_id)
-    except ValueError:
-        console.print(f"[bold red]✗ Error: Invalid UUID format: {file_id}[/bold red]")
-        sys.exit(1)
+    # Determine if file_ref is UUID or path
+    file_uuid: Optional[UUID] = None
+    file_path: Optional[Path] = None
+
+    if _is_uuid(file_ref):
+        file_uuid = UUID(file_ref)
+        console.print(f"[dim]Using file_id: {file_uuid}[/dim]")
+    else:
+        file_path = Path(file_ref)
+        if not file_path.exists():
+            console.print(f"[bold red]✗ Error: File not found: {file_path}[/bold red]")
+            sys.exit(1)
+        file_path = file_path.absolute()
+        console.print(f"[dim]Using file path: {file_path}[/dim]")
 
     try:
         # Get database session
@@ -253,7 +275,11 @@ def parse_mwtab(
         parse_service = ParseService(db)
 
         # Parse file
-        stats = parse_service.parse_mwtab_file(file_uuid, dry_run=dry_run)
+        stats = parse_service.parse_mwtab_file(
+            file_id=file_uuid,
+            file_path=file_path,
+            dry_run=dry_run
+        )
 
         # Display results
         table = Table(title="mwTab Parse Results")
@@ -262,10 +288,20 @@ def parse_mwtab(
 
         table.add_row("Study ID", stats.study_id or "N/A")
         table.add_row("Analysis ID", stats.analysis_id or "N/A")
-        table.add_row("Samples Processed", str(stats.samples_processed))
-        table.add_row("Factors Written", str(stats.factors_written))
+        table.add_row("", "")
+        table.add_row("[bold]Samples[/bold]", "")
+        table.add_row("  Processed", str(stats.samples_processed))
+        table.add_row("  Created", str(stats.samples_created))
+        table.add_row("", "")
+        table.add_row("[bold]Features (Metabolites)[/bold]", "")
+        table.add_row("  Processed", str(stats.features_processed))
+        table.add_row("  Created", str(stats.features_created))
+        table.add_row("", "")
+        table.add_row("[bold]Measurements[/bold]", "")
+        table.add_row("  Processed", str(stats.measurements_processed))
+        table.add_row("  Inserted/Updated", str(stats.measurements_inserted))
+        table.add_row("", "")
         table.add_row("Warnings", str(stats.warnings_count))
-        table.add_row("Skipped", str(stats.skipped_count))
         table.add_row("Mode", "Dry Run" if dry_run else "Production")
 
         console.print(table)
@@ -273,8 +309,8 @@ def parse_mwtab(
         if stats.warnings_count > 0:
             console.print(f"[bold yellow]⚠ {stats.warnings_count} warnings during parsing[/bold yellow]")
 
-        if stats.skipped_count > 0:
-            console.print(f"[bold yellow]⚠ {stats.skipped_count} samples skipped due to errors[/bold yellow]")
+        if stats.measurements_processed == 0 and stats.features_processed == 0:
+            console.print("[bold yellow]⚠ No MS_METABOLITE_DATA section found (may be NMR study)[/bold yellow]")
 
         if not dry_run:
             console.print("[bold green]✓ File parsed and data stored successfully![/bold green]")

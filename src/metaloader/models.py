@@ -87,21 +87,23 @@ class Study(Base):
 
 
 class Analysis(Base):
-    """Analyses placeholder table."""
+    """Analyses table."""
 
     __tablename__ = "analyses"
 
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     study_pk = Column(UUID(as_uuid=True), ForeignKey("studies.id"), nullable=True)
     analysis_id = Column(Text, nullable=True)
+    file_id = Column(UUID(as_uuid=True), ForeignKey("files.id", ondelete="SET NULL"), nullable=True)
     created_at = Column(TIMESTAMP(timezone=True), default=utc_now, nullable=False)
 
     # Relationships
     study = relationship("Study", back_populates="analyses")
+    file = relationship("File")
 
 
 class Sample(Base):
-    """Samples placeholder table."""
+    """Samples table."""
 
     __tablename__ = "samples"
 
@@ -109,6 +111,7 @@ class Sample(Base):
     study_pk = Column(UUID(as_uuid=True), ForeignKey("studies.id"), nullable=True)
     sample_label = Column(Text, nullable=True)
     sample_uid = Column(Text, unique=True, nullable=True)
+    factors_raw = Column(Text, nullable=True)
     created_at = Column(TIMESTAMP(timezone=True), default=utc_now, nullable=False)
 
     # Relationships
@@ -118,7 +121,7 @@ class Sample(Base):
 
 
 class Feature(Base):
-    """Features placeholder table."""
+    """Features table (metabolites, bins, etc.)."""
 
     __tablename__ = "features"
 
@@ -133,7 +136,7 @@ class Feature(Base):
 
 
 class Measurement(Base):
-    """Measurements placeholder table."""
+    """Measurements table."""
 
     __tablename__ = "measurements"
 
@@ -149,6 +152,7 @@ class Measurement(Base):
     feature = relationship("Feature", back_populates="measurements")
 
     __table_args__ = (
+        UniqueConstraint("sample_uid", "feature_uid", name="uq_measurement_sample_feature"),
         Index("idx_measurement_sample", "sample_uid"),
         Index("idx_measurement_feature", "feature_uid"),
     )

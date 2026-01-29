@@ -180,17 +180,17 @@ Or mark as failed:
 metaloader import finalize 550e8400-e29b-41d4-a716-446655440000 --status failed --notes "Error during processing"
 ```
 
-### 5. Parse mwTab Files (Phase 2.1)
+### 5. Parse mwTab Files (Phase 2)
 
-After ingesting files, you can parse mwTab files to extract sample metadata and factors.
+After ingesting files, parse mwTab files to extract samples, metabolites, and measurements.
 
-**First, find the file_id from database:**
+**Find file_id from database:**
 
 ```sql
 -- Connect to database
 psql -d metaloader
 
--- List ingested files
+-- List ingested mwTab files
 SELECT id, filename, detected_type, created_at
 FROM files
 WHERE detected_type = 'mwtab'
@@ -198,61 +198,108 @@ ORDER BY created_at DESC
 LIMIT 20;
 ```
 
-**Parse a mwTab file:**
+**Parse using file_id (from database):**
 
 ```bash
-metaloader parse mwtab --file-id <file-uuid>
+metaloader parse mwtab <file-uuid>
 ```
 
-Example output:
+**Parse using file path (direct):**
+
+```bash
+metaloader parse mwtab "/path/to/study_ST000315_AN000501.txt"
 ```
-Parsing mwTab file: 660e9511-f3ac-52e5-b827-557766551111
-╭──────────────────────┬─────────────────╮
-│ Property             │ Value           │
-├──────────────────────┼─────────────────┤
-│ Study ID             │ ST000315        │
-│ Analysis ID          │ AN000501        │
-│ Samples Processed    │ 45              │
-│ Factors Written      │ 135             │
-│ Warnings             │ 2               │
-│ Skipped              │ 0               │
-│ Mode                 │ Production      │
-╰──────────────────────┴─────────────────╯
+
+**Example output:**
+```
+Parsing mwTab: 660e9511-f3ac-52e5-b827-557766551111
+Using file_id: 660e9511-f3ac-52e5-b827-557766551111
+╭───────────────────────────────┬─────────────╮
+│ Property                      │ Value       │
+├───────────────────────────────┼─────────────┤
+│ Study ID                      │ ST000315    │
+│ Analysis ID                   │ AN000501    │
+│                               │             │
+│ Samples                       │             │
+│   Processed                   │ 233         │
+│   Created                     │ 233         │
+│                               │             │
+│ Features (Metabolites)        │             │
+│   Processed                   │ 156         │
+│   Created                     │ 156         │
+│                               │             │
+│ Measurements                  │             │
+│   Processed                   │ 36348       │
+│   Inserted/Updated            │ 36348       │
+│                               │             │
+│ Warnings                      │ 0           │
+│ Mode                          │ Production  │
+╰───────────────────────────────┴─────────────╯
 ✓ File parsed and data stored successfully!
 ```
 
-**Dry run mode** (preview without writing to database):
+**Dry run mode** (preview without writing):
 
 ```bash
-metaloader parse mwtab --file-id <file-uuid> --dry-run
+metaloader parse mwtab <file-uuid-or-path> --dry-run
 ```
 
 **What gets parsed:**
-- Study and Analysis IDs from file metadata
-- Sample labels from `SUBJECT_SAMPLE_FACTORS` section
-- Factor key-value pairs (e.g., `Group:Exercise`, `Visit:1`)
-- Creates stable `sample_uid` as `{study_id}:{analysis_id}:{normalized_label}`
 
-**Check parsed data in database:**
+1. **Metadata**: `STUDY_ID`, `ANALYSIS_ID` from file header
+2. **Samples**: From `SUBJECT_SAMPLE_FACTORS` section
+   - `sample_uid` = `{study_id}:{sample_label}`
+   - Raw factors string saved to `factors_raw`
+3. **Metabolites/Features**: From `MS_METABOLITE_DATA` section
+   - `feature_uid` = `{analysis_id}:met:{normalized_name}`
+   - `feature_type` = 'metabolite'
+4. **Measurements**: Values from MS data table
+   - Linked by `(sample_uid, feature_uid)`
+   - Units detected from `MS_METABOLITE_DATA:UNITS`
+   - NA/empty values stored as NULL
+
+**Idempotency**: Running the same file twice will update existing records (upsert), not create duplicates.
+
+**Check parsed data:**
 
 ```sql
--- View studies and analyses
-SELECT s.study_id, a.analysis_id, COUNT(DISTINCT sam.id) as sample_count
+-- Overview of studies and analyses
+SELECT s.study_id, a.analysis_id,
+       COUNT(DISTINCT sam.id) as samples,
+       COUNT(DISTINCT f.id) as features,
+       COUNT(DISTINCT m.id) as measurements
 FROM studies s
-JOIN analyses a ON a.study_pk = s.id
-JOIN samples sam ON sam.study_pk = s.id
+LEFT JOIN analyses a ON a.study_pk = s.id
+LEFT JOIN samples sam ON sam.study_pk = s.id
+LEFT JOIN features f ON f.feature_uid LIKE a.analysis_id || ':%'
+LEFT JOIN measurements m ON m.sample_uid = sam.sample_uid
 GROUP BY s.study_id, a.analysis_id;
 
 -- View samples for a study
-SELECT sample_uid, sample_label
+SELECT sample_uid, sample_label, factors_raw
 FROM samples
 WHERE study_pk = (SELECT id FROM studies WHERE study_id = 'ST000315')
 LIMIT 10;
 
--- View factors for a sample
-SELECT factor_key, factor_value
-FROM sample_factors
-WHERE sample_uid = 'ST000315:AN000501:6018_post_B_S_87';
+-- View metabolites for an analysis
+SELECT feature_uid, name_raw, feature_type
+FROM features
+WHERE feature_uid LIKE 'AN000501:%'
+LIMIT 10;
+
+-- View measurements for a sample
+SELECT f.name_raw, m.value, m.unit
+FROM measurements m
+JOIN features f ON f.feature_uid = m.feature_uid
+WHERE m.sample_uid = 'ST000315:Sample1'
+ORDER BY f.name_raw;
+
+-- Count measurements per study
+SELECT s.study_id, COUNT(*) as measurement_count
+FROM measurements m
+JOIN samples sam ON sam.sample_uid = m.sample_uid
+JOIN studies s ON s.id = sam.study_pk
+GROUP BY s.study_id;
 ```
 
 ## Database Schema
@@ -270,35 +317,46 @@ WHERE sample_uid = 'ST000315:AN000501:6018_post_B_S_87';
 - Unique constraint: `(sha256, size_bytes)`
 - Index on: `sha256`
 
-### Metadata Tables (Phase 2.1)
+### Data Tables (Phase 2)
 
 **studies**
 - Study metadata
 - Fields: `id`, `study_id`, `created_at`
-- Populated by mwTab parser
+- Upsert by: `study_id`
 
 **analyses**
 - Analysis metadata
-- Fields: `id`, `study_pk`, `analysis_id`, `created_at`
-- Linked to studies
+- Fields: `id`, `study_pk`, `analysis_id`, `file_id`, `created_at`
+- Foreign keys: `study_pk` → `studies.id`, `file_id` → `files.id`
+- Upsert by: `(study_pk, analysis_id)`
 
 **samples**
 - Sample information
-- Fields: `id`, `study_pk`, `sample_label`, `sample_uid`, `created_at`
+- Fields: `id`, `study_pk`, `sample_label`, `sample_uid`, `factors_raw`, `created_at`
 - Unique constraint: `sample_uid`
-- `sample_uid` format: `{study_id}:{analysis_id}:{normalized_label}`
+- `sample_uid` format: `{study_id}:{sample_label}`
+- `factors_raw`: Raw factors string from mwTab (e.g., "Group:Exercise | Visit:1")
 
 **sample_factors**
-- Sample metadata key-value pairs
+- Sample metadata key-value pairs (parsed from factors_raw)
 - Fields: `id`, `sample_uid`, `factor_key`, `factor_value`, `created_at`
 - Unique constraint: `(sample_uid, factor_key)`
 - Foreign key: `sample_uid` → `samples.sample_uid` (ON DELETE CASCADE)
-- Populated by mwTab parser from `SUBJECT_SAMPLE_FACTORS` section
 
-### Placeholder Tables (Not yet populated)
+**features**
+- Metabolite/feature definitions
+- Fields: `id`, `feature_uid`, `feature_type`, `name_raw`, `created_at`
+- Unique constraint: `feature_uid`
+- `feature_uid` format: `{analysis_id}:met:{normalized_name}`
+- `feature_type`: 'metabolite' for MS data
 
-- `features` - Metabolite features (Phase 2.2+)
-- `measurements` - Feature measurements per sample (Phase 2.2+)
+**measurements**
+- Feature values per sample
+- Fields: `id`, `sample_uid`, `feature_uid`, `value`, `unit`, `created_at`
+- Unique constraint: `(sample_uid, feature_uid)` - enables upsert
+- Foreign keys: `sample_uid` → `samples.sample_uid`, `feature_uid` → `features.feature_uid`
+- `value`: Float, NULL for missing/NA values
+- `unit`: Detected from `MS_METABOLITE_DATA:UNITS`
 
 ## File Type Detection
 
@@ -355,7 +413,8 @@ alembic/
 ├── env.py              # Alembic environment
 └── versions/
     ├── 001_initial_schema.py  # Initial migration
-    └── 002_add_sample_factors.py  # Sample factors table
+    ├── 002_add_sample_factors.py  # Sample factors table
+    └── 003_add_factors_raw_and_measurements_constraint.py  # Phase 2
 
 tests/
 ├── test_hashing.py
@@ -395,25 +454,27 @@ metaloader db init
 
 - ✅ **Phase 1**: Foundation
   - Database schema
-  - File ingestion
+  - File ingestion with deduplication
   - Import tracking
 
-- 🔄 **Phase 2**: Parsing
-  - ✅ **Phase 2.1** (current): mwTab sample factors
-    - Parse `SUBJECT_SAMPLE_FACTORS` section
-    - Extract study/analysis/sample metadata
-    - Store sample factors as key-value pairs
-  - 📋 **Phase 2.2** (planned): mwTab measurements
-    - Parse metabolite data tables
-    - Populate features and measurements
-  - 📋 **Phase 2.3** (planned): Other formats
-    - HTML table parser
-    - Excel parser
+- ✅ **Phase 2**: mwTab Parsing (current)
+  - Parse `SUBJECT_SAMPLE_FACTORS` section
+  - Parse `MS_METABOLITE_DATA` section
+  - Extract study/analysis/sample metadata
+  - Create features and measurements
+  - Batch upserts for performance
+  - Idempotent: re-running updates existing data
 
-- 📋 **Phase 3**: Analysis (planned)
+- 📋 **Phase 3**: Additional Formats (planned)
+  - NMR binned data parser (Excel)
+  - HTML table parser
+  - CSV/TSV parsers
+
+- 📋 **Phase 4**: Analysis (planned)
   - Data validation
   - Quality checks
   - Export functionality
+  - Data aggregation/normalization
 
 ## Contributing
 
