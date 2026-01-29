@@ -174,7 +174,12 @@ class ParseService:
                     samples_created += 1
             
             stats.samples_created = samples_created
-            
+            stats.samples_processed = len(all_sample_labels)
+
+            # Flush samples to DB before inserting measurements (FK constraint)
+            self.db.flush()
+            logger.debug(f"Flushed {len(all_sample_labels)} samples to database")
+
             # 5. Process metabolites and measurements
             if result.metabolites:
                 features_created, measurements_inserted, measurements_updated = (
@@ -272,7 +277,7 @@ class ParseService:
                 factors_raw=factors_raw
             )
             self.db.add(sample)
-            self.db.flush()
+            self.db.flush()  # Flush immediately to ensure FK works
             logger.debug(f"Created sample: {sample_uid}")
             return True
         else:
@@ -384,36 +389,77 @@ class ParseService:
 
     def _batch_upsert_measurements(self, batch: List[dict]) -> tuple[int, int]:
         """Batch upsert measurements using PostgreSQL INSERT ON CONFLICT.
-        
+
         Returns:
             Tuple of (inserted_count, updated_count)
         """
         if not batch:
             return 0, 0
-        
-        # Use PostgreSQL INSERT ... ON CONFLICT DO UPDATE
-        stmt = insert(Measurement).values(batch)
-        
-        # On conflict, update value only if new value is not NULL
-        stmt = stmt.on_conflict_do_update(
-            constraint='uq_measurement_sample_feature',
-            set_={
-                'value': text('COALESCE(EXCLUDED.value, measurements.value)'),
-                'unit': text('COALESCE(EXCLUDED.unit, measurements.unit)')
-            }
-        )
-        
-        # Execute and get row count
-        result = self.db.execute(stmt)
-        
-        # Note: PostgreSQL doesn't easily distinguish inserts vs updates in ON CONFLICT
-        # We'll estimate based on affected rows
-        # For simplicity, count all as "processed" - exact split would require extra queries
-        total = result.rowcount if result.rowcount else len(batch)
-        
-        # Since we can't easily tell inserts from updates, we'll count as inserts
-        # The actual split would require checking existing records first
-        return total, 0
+
+        # Create savepoint before batch operation
+        savepoint = self.db.begin_nested()
+
+        try:
+            # Use PostgreSQL INSERT ... ON CONFLICT DO UPDATE
+            # Use index_elements instead of constraint name for better compatibility
+            stmt = insert(Measurement).values(batch)
+
+            # On conflict, update value only if new value is not NULL
+            stmt = stmt.on_conflict_do_update(
+                index_elements=['sample_uid', 'feature_uid'],
+                set_={
+                    'value': text('COALESCE(EXCLUDED.value, measurements.value)'),
+                    'unit': text('COALESCE(EXCLUDED.unit, measurements.unit)')
+                }
+            )
+
+            # Execute and get row count
+            result = self.db.execute(stmt)
+            savepoint.commit()
+
+            total = result.rowcount if result.rowcount else len(batch)
+            return total, 0
+
+        except Exception as e:
+            # Rollback savepoint to restore transaction to clean state
+            savepoint.rollback()
+            logger.warning(f"Batch upsert failed, falling back to individual inserts: {e}")
+
+            inserted = 0
+            for item in batch:
+                # Use savepoint for each individual insert
+                item_savepoint = self.db.begin_nested()
+                try:
+                    # Check if measurement exists
+                    existing = (
+                        self.db.query(Measurement)
+                        .filter(
+                            Measurement.sample_uid == item['sample_uid'],
+                            Measurement.feature_uid == item['feature_uid']
+                        )
+                        .first()
+                    )
+
+                    if existing:
+                        # Update if new value is not None
+                        if item['value'] is not None:
+                            existing.value = item['value']
+                        if item['unit'] is not None:
+                            existing.unit = item['unit']
+                    else:
+                        # Insert new
+                        measurement = Measurement(**item)
+                        self.db.add(measurement)
+                        inserted += 1
+
+                    item_savepoint.commit()
+                except Exception as inner_e:
+                    item_savepoint.rollback()
+                    logger.warning(f"Failed to insert measurement: {inner_e}")
+                    continue
+
+            self.db.flush()
+            return inserted, 0
 
     def _upsert_sample_factors(
         self, result: MwTabParseResult, sample_uid_map: Dict[str, str]
