@@ -17,6 +17,7 @@ from metaloader.database import get_db, test_connection, engine
 from metaloader.models import Base
 from metaloader.services.file_handler import FileHandler
 from metaloader.services.import_service import ImportService
+from metaloader.services.parse_service import ParseService
 
 # Setup logging
 logging.basicConfig(
@@ -30,7 +31,9 @@ logger = logging.getLogger(__name__)
 # CLI app
 app = typer.Typer(help="Metaloader - Tool for loading metabolomics data into PostgreSQL")
 db_app = typer.Typer(help="Database management commands")
+parse_app = typer.Typer(help="Parse and extract data from files")
 app.add_typer(db_app, name="db")
+app.add_typer(parse_app, name="parse")
 
 console = Console()
 
@@ -221,6 +224,72 @@ def import_finalize(
     except Exception as e:
         console.print(f"[bold red]✗ Error: {e}[/bold red]")
         logger.exception("Error during import finalization")
+        sys.exit(1)
+
+
+@parse_app.command("mwtab")
+def parse_mwtab(
+    file_id: str = typer.Option(..., "--file-id", help="UUID of file to parse"),
+    dry_run: bool = typer.Option(False, "--dry-run", help="Don't write to database, only show stats"),
+):
+    """Parse mwTab file and extract sample factors."""
+    console.print(f"[bold blue]Parsing mwTab file: {file_id}[/bold blue]")
+
+    if dry_run:
+        console.print("[bold yellow]⚠ Dry run mode - not writing to database[/bold yellow]")
+
+    try:
+        # Parse UUID
+        file_uuid = UUID(file_id)
+    except ValueError:
+        console.print(f"[bold red]✗ Error: Invalid UUID format: {file_id}[/bold red]")
+        sys.exit(1)
+
+    try:
+        # Get database session
+        db = next(get_db())
+
+        # Initialize service
+        parse_service = ParseService(db)
+
+        # Parse file
+        stats = parse_service.parse_mwtab_file(file_uuid, dry_run=dry_run)
+
+        # Display results
+        table = Table(title="mwTab Parse Results")
+        table.add_column("Property", style="cyan")
+        table.add_column("Value", style="green")
+
+        table.add_row("Study ID", stats.study_id or "N/A")
+        table.add_row("Analysis ID", stats.analysis_id or "N/A")
+        table.add_row("Samples Processed", str(stats.samples_processed))
+        table.add_row("Factors Written", str(stats.factors_written))
+        table.add_row("Warnings", str(stats.warnings_count))
+        table.add_row("Skipped", str(stats.skipped_count))
+        table.add_row("Mode", "Dry Run" if dry_run else "Production")
+
+        console.print(table)
+
+        if stats.warnings_count > 0:
+            console.print(f"[bold yellow]⚠ {stats.warnings_count} warnings during parsing[/bold yellow]")
+
+        if stats.skipped_count > 0:
+            console.print(f"[bold yellow]⚠ {stats.skipped_count} samples skipped due to errors[/bold yellow]")
+
+        if not dry_run:
+            console.print("[bold green]✓ File parsed and data stored successfully![/bold green]")
+        else:
+            console.print("[bold blue]✓ Dry run completed - no data was written[/bold blue]")
+
+    except ValueError as e:
+        console.print(f"[bold red]✗ Validation error: {e}[/bold red]")
+        sys.exit(1)
+    except FileNotFoundError as e:
+        console.print(f"[bold red]✗ File not found: {e}[/bold red]")
+        sys.exit(1)
+    except Exception as e:
+        console.print(f"[bold red]✗ Error: {e}[/bold red]")
+        logger.exception("Error during mwTab parsing")
         sys.exit(1)
 
 

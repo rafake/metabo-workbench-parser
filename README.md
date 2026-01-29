@@ -180,6 +180,81 @@ Or mark as failed:
 metaloader import finalize 550e8400-e29b-41d4-a716-446655440000 --status failed --notes "Error during processing"
 ```
 
+### 5. Parse mwTab Files (Phase 2.1)
+
+After ingesting files, you can parse mwTab files to extract sample metadata and factors.
+
+**First, find the file_id from database:**
+
+```sql
+-- Connect to database
+psql -d metaloader
+
+-- List ingested files
+SELECT id, filename, detected_type, created_at
+FROM files
+WHERE detected_type = 'mwtab'
+ORDER BY created_at DESC
+LIMIT 20;
+```
+
+**Parse a mwTab file:**
+
+```bash
+metaloader parse mwtab --file-id <file-uuid>
+```
+
+Example output:
+```
+Parsing mwTab file: 660e9511-f3ac-52e5-b827-557766551111
+╭──────────────────────┬─────────────────╮
+│ Property             │ Value           │
+├──────────────────────┼─────────────────┤
+│ Study ID             │ ST000315        │
+│ Analysis ID          │ AN000501        │
+│ Samples Processed    │ 45              │
+│ Factors Written      │ 135             │
+│ Warnings             │ 2               │
+│ Skipped              │ 0               │
+│ Mode                 │ Production      │
+╰──────────────────────┴─────────────────╯
+✓ File parsed and data stored successfully!
+```
+
+**Dry run mode** (preview without writing to database):
+
+```bash
+metaloader parse mwtab --file-id <file-uuid> --dry-run
+```
+
+**What gets parsed:**
+- Study and Analysis IDs from file metadata
+- Sample labels from `SUBJECT_SAMPLE_FACTORS` section
+- Factor key-value pairs (e.g., `Group:Exercise`, `Visit:1`)
+- Creates stable `sample_uid` as `{study_id}:{analysis_id}:{normalized_label}`
+
+**Check parsed data in database:**
+
+```sql
+-- View studies and analyses
+SELECT s.study_id, a.analysis_id, COUNT(DISTINCT sam.id) as sample_count
+FROM studies s
+JOIN analyses a ON a.study_pk = s.id
+JOIN samples sam ON sam.study_pk = s.id
+GROUP BY s.study_id, a.analysis_id;
+
+-- View samples for a study
+SELECT sample_uid, sample_label
+FROM samples
+WHERE study_pk = (SELECT id FROM studies WHERE study_id = 'ST000315')
+LIMIT 10;
+
+-- View factors for a sample
+SELECT factor_key, factor_value
+FROM sample_factors
+WHERE sample_uid = 'ST000315:AN000501:6018_post_B_S_87';
+```
+
 ## Database Schema
 
 ### Core Tables (Phase 1)
@@ -195,14 +270,35 @@ metaloader import finalize 550e8400-e29b-41d4-a716-446655440000 --status failed 
 - Unique constraint: `(sha256, size_bytes)`
 - Index on: `sha256`
 
-### Placeholder Tables (Phase 1)
+### Metadata Tables (Phase 2.1)
 
-These tables are created but not populated yet:
-- `studies` - Study metadata
-- `analyses` - Analysis metadata
-- `samples` - Sample information
-- `features` - Metabolite features
-- `measurements` - Feature measurements per sample
+**studies**
+- Study metadata
+- Fields: `id`, `study_id`, `created_at`
+- Populated by mwTab parser
+
+**analyses**
+- Analysis metadata
+- Fields: `id`, `study_pk`, `analysis_id`, `created_at`
+- Linked to studies
+
+**samples**
+- Sample information
+- Fields: `id`, `study_pk`, `sample_label`, `sample_uid`, `created_at`
+- Unique constraint: `sample_uid`
+- `sample_uid` format: `{study_id}:{analysis_id}:{normalized_label}`
+
+**sample_factors**
+- Sample metadata key-value pairs
+- Fields: `id`, `sample_uid`, `factor_key`, `factor_value`, `created_at`
+- Unique constraint: `(sample_uid, factor_key)`
+- Foreign key: `sample_uid` → `samples.sample_uid` (ON DELETE CASCADE)
+- Populated by mwTab parser from `SUBJECT_SAMPLE_FACTORS` section
+
+### Placeholder Tables (Not yet populated)
+
+- `features` - Metabolite features (Phase 2.2+)
+- `measurements` - Feature measurements per sample (Phase 2.2+)
 
 ## File Type Detection
 
@@ -245,9 +341,12 @@ src/metaloader/
 ├── config.py           # Configuration (env vars)
 ├── database.py         # SQLAlchemy setup
 ├── models.py           # Database models
+├── parsers/
+│   └── mwtab.py           # mwTab format parser
 ├── services/
 │   ├── file_handler.py    # File processing logic
-│   └── import_service.py  # Import management
+│   ├── import_service.py  # Import management
+│   └── parse_service.py   # Parsing and data extraction
 └── utils/
     ├── hashing.py         # SHA256 streaming
     └── type_detector.py   # File type detection
@@ -255,11 +354,13 @@ src/metaloader/
 alembic/
 ├── env.py              # Alembic environment
 └── versions/
-    └── 001_initial_schema.py  # Initial migration
+    ├── 001_initial_schema.py  # Initial migration
+    └── 002_add_sample_factors.py  # Sample factors table
 
 tests/
 ├── test_hashing.py
-└── test_type_detector.py
+├── test_type_detector.py
+└── test_mwtab_parser.py
 ```
 
 ## Troubleshooting
@@ -292,18 +393,24 @@ metaloader db init
 
 ## Roadmap
 
-- ✅ **Phase 1**: Foundation (current)
+- ✅ **Phase 1**: Foundation
   - Database schema
   - File ingestion
   - Import tracking
 
-- 🔄 **Phase 2**: Parsing (planned)
-  - MWTAB parser
-  - HTML table parser
-  - Excel parser
-  - Populate studies, samples, features, measurements
+- 🔄 **Phase 2**: Parsing
+  - ✅ **Phase 2.1** (current): mwTab sample factors
+    - Parse `SUBJECT_SAMPLE_FACTORS` section
+    - Extract study/analysis/sample metadata
+    - Store sample factors as key-value pairs
+  - 📋 **Phase 2.2** (planned): mwTab measurements
+    - Parse metabolite data tables
+    - Populate features and measurements
+  - 📋 **Phase 2.3** (planned): Other formats
+    - HTML table parser
+    - Excel parser
 
-- 🔄 **Phase 3**: Analysis (planned)
+- 📋 **Phase 3**: Analysis (planned)
   - Data validation
   - Quality checks
   - Export functionality

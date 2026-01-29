@@ -114,6 +114,7 @@ class Sample(Base):
     # Relationships
     study = relationship("Study", back_populates="samples")
     measurements = relationship("Measurement", back_populates="sample")
+    factors = relationship("SampleFactor", back_populates="sample", cascade="all, delete-orphan")
 
 
 class Feature(Base):
@@ -150,4 +151,24 @@ class Measurement(Base):
     __table_args__ = (
         Index("idx_measurement_sample", "sample_uid"),
         Index("idx_measurement_feature", "feature_uid"),
+    )
+
+
+class SampleFactor(Base):
+    """Sample factors table - metadata key-value pairs for samples."""
+
+    __tablename__ = "sample_factors"
+
+    id = Column(BigInteger, primary_key=True, autoincrement=True)
+    sample_uid = Column(Text, ForeignKey("samples.sample_uid", ondelete="CASCADE"), nullable=False)
+    factor_key = Column(Text, nullable=False)
+    factor_value = Column(Text, nullable=False)
+    created_at = Column(TIMESTAMP(timezone=True), default=utc_now, nullable=False)
+
+    # Relationships
+    sample = relationship("Sample", back_populates="factors")
+
+    __table_args__ = (
+        UniqueConstraint("sample_uid", "factor_key", name="uq_sample_factor"),
+        Index("idx_sample_factors_sample_uid", "sample_uid"),
     )
