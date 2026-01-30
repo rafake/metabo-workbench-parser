@@ -18,7 +18,10 @@ from metaloader.models import Base
 from metaloader.services.file_handler import FileHandler
 from metaloader.services.import_service import ImportService
 from metaloader.services.parse_service import ParseService
+from metaloader.services.parse_ms_service import ParseMSService
+from metaloader.services.parse_nmr_service import ParseNMRService
 from metaloader.qc import QCService, QCFilters
+from metaloader.models import File
 
 # Setup logging
 logging.basicConfig(
@@ -329,6 +332,245 @@ def parse_mwtab(
     except Exception as e:
         console.print(f"[bold red]✗ Error: {e}[/bold red]")
         logger.exception("Error during mwTab parsing")
+        sys.exit(1)
+
+
+@parse_app.command("mwtab-ms")
+def parse_mwtab_ms(
+    file_ref: str = typer.Argument(None, help="Path to mwTab file (or use --file-id)"),
+    file_id: Optional[str] = typer.Option(None, "--file-id", help="UUID of file from database"),
+    dry_run: bool = typer.Option(False, "--dry-run", help="Don't write to database, only show stats"),
+):
+    """Parse mwTab file MS_METABOLITE_DATA section and store measurements.
+
+    This command parses LC/GC-MS metabolite data with:
+    - Column-level tracking (col_index)
+    - Replicate detection (replicate_ix)
+    - Idempotent inserts (no duplicates)
+
+    Provide either a file path or --file-id to parse from database.
+    """
+    # Validate inputs
+    if not file_ref and not file_id:
+        console.print("[bold red]✗ Error: Provide either a file path or --file-id[/bold red]")
+        sys.exit(1)
+
+    if file_ref and file_id:
+        console.print("[bold red]✗ Error: Provide either file path OR --file-id, not both[/bold red]")
+        sys.exit(1)
+
+    file_uuid: Optional[UUID] = None
+    file_path: Optional[Path] = None
+
+    if file_id:
+        try:
+            file_uuid = UUID(file_id)
+        except ValueError:
+            console.print(f"[bold red]✗ Error: Invalid UUID format: {file_id}[/bold red]")
+            sys.exit(1)
+        console.print(f"[bold blue]Parsing MS data from file_id: {file_uuid}[/bold blue]")
+    else:
+        file_path = Path(file_ref)
+        if not file_path.exists():
+            console.print(f"[bold red]✗ Error: File not found: {file_path}[/bold red]")
+            sys.exit(1)
+        file_path = file_path.absolute()
+        console.print(f"[bold blue]Parsing MS data from: {file_path}[/bold blue]")
+
+    if dry_run:
+        console.print("[bold yellow]⚠ Dry run mode - not writing to database[/bold yellow]")
+
+    try:
+        # Get database session
+        db = next(get_db())
+
+        # If file_id provided, look up the file record
+        if file_uuid:
+            file_record = db.query(File).filter(File.id == file_uuid).first()
+            if not file_record:
+                console.print(f"[bold red]✗ Error: File not found in database: {file_uuid}[/bold red]")
+                sys.exit(1)
+            file_path = Path(file_record.path_abs)
+            if not file_path.exists():
+                console.print(f"[bold red]✗ Error: File path not found: {file_path}[/bold red]")
+                sys.exit(1)
+
+        # Initialize service
+        parse_service = ParseMSService(db)
+
+        # Parse file
+        stats = parse_service.parse_file(
+            file_path=file_path,
+            file_id=file_uuid,
+            dry_run=dry_run
+        )
+
+        # Display results
+        table = Table(title="MS Metabolite Data Parse Results")
+        table.add_column("Property", style="cyan")
+        table.add_column("Value", style="green")
+
+        table.add_row("Study ID", stats.study_id or "N/A")
+        table.add_row("Analysis ID", stats.analysis_id or "N/A")
+        table.add_row("", "")
+        table.add_row("[bold]Samples[/bold]", "")
+        table.add_row("  Processed", str(stats.samples_processed))
+        table.add_row("  Created", str(stats.samples_created))
+        table.add_row("", "")
+        table.add_row("[bold]Features (Metabolites)[/bold]", "")
+        table.add_row("  Processed", str(stats.features_processed))
+        table.add_row("  Created", str(stats.features_created))
+        table.add_row("", "")
+        table.add_row("[bold]Measurements[/bold]", "")
+        table.add_row("  Processed", str(stats.measurements_processed))
+        table.add_row("  Inserted", str(stats.measurements_inserted))
+        table.add_row("  Skipped (conflict)", str(stats.measurements_skipped))
+        table.add_row("", "")
+        table.add_row("Warnings", str(stats.warnings_count))
+        table.add_row("Mode", "Dry Run" if dry_run else "Production")
+
+        console.print(table)
+
+        if stats.warnings_count > 0:
+            console.print(f"[bold yellow]⚠ {stats.warnings_count} warnings during parsing[/bold yellow]")
+
+        if stats.measurements_skipped > 0:
+            console.print(f"[dim]Note: {stats.measurements_skipped} measurements skipped (already exist)[/dim]")
+
+        if not dry_run:
+            console.print("[bold green]✓ MS data parsed and stored successfully![/bold green]")
+        else:
+            console.print("[bold blue]✓ Dry run completed - no data was written[/bold blue]")
+
+    except ValueError as e:
+        console.print(f"[bold red]✗ Validation error: {e}[/bold red]")
+        sys.exit(1)
+    except FileNotFoundError as e:
+        console.print(f"[bold red]✗ File not found: {e}[/bold red]")
+        sys.exit(1)
+    except Exception as e:
+        console.print(f"[bold red]✗ Error: {e}[/bold red]")
+        logger.exception("Error during MS data parsing")
+        sys.exit(1)
+
+
+@parse_app.command("mwtab-nmr-binned")
+def parse_mwtab_nmr_binned(
+    file_ref: str = typer.Argument(None, help="Path to mwTab file (or use --file-id)"),
+    file_id: Optional[str] = typer.Option(None, "--file-id", help="UUID of file from database"),
+    dry_run: bool = typer.Option(False, "--dry-run", help="Don't write to database, only show stats"),
+):
+    """Parse mwTab file NMR_BINNED_DATA section and store measurements.
+
+    This command parses NMR binned data with:
+    - Bin range (ppm) as features
+    - Column-level tracking (col_index)
+    - Replicate detection (replicate_ix)
+    - Idempotent inserts (no duplicates)
+
+    Provide either a file path or --file-id to parse from database.
+    """
+    # Validate inputs
+    if not file_ref and not file_id:
+        console.print("[bold red]✗ Error: Provide either a file path or --file-id[/bold red]")
+        sys.exit(1)
+
+    if file_ref and file_id:
+        console.print("[bold red]✗ Error: Provide either file path OR --file-id, not both[/bold red]")
+        sys.exit(1)
+
+    file_uuid: Optional[UUID] = None
+    file_path: Optional[Path] = None
+
+    if file_id:
+        try:
+            file_uuid = UUID(file_id)
+        except ValueError:
+            console.print(f"[bold red]✗ Error: Invalid UUID format: {file_id}[/bold red]")
+            sys.exit(1)
+        console.print(f"[bold blue]Parsing NMR binned data from file_id: {file_uuid}[/bold blue]")
+    else:
+        file_path = Path(file_ref)
+        if not file_path.exists():
+            console.print(f"[bold red]✗ Error: File not found: {file_path}[/bold red]")
+            sys.exit(1)
+        file_path = file_path.absolute()
+        console.print(f"[bold blue]Parsing NMR binned data from: {file_path}[/bold blue]")
+
+    if dry_run:
+        console.print("[bold yellow]⚠ Dry run mode - not writing to database[/bold yellow]")
+
+    try:
+        # Get database session
+        db = next(get_db())
+
+        # If file_id provided, look up the file record
+        if file_uuid:
+            file_record = db.query(File).filter(File.id == file_uuid).first()
+            if not file_record:
+                console.print(f"[bold red]✗ Error: File not found in database: {file_uuid}[/bold red]")
+                sys.exit(1)
+            file_path = Path(file_record.path_abs)
+            if not file_path.exists():
+                console.print(f"[bold red]✗ Error: File path not found: {file_path}[/bold red]")
+                sys.exit(1)
+
+        # Initialize service
+        parse_service = ParseNMRService(db)
+
+        # Parse file
+        stats = parse_service.parse_file(
+            file_path=file_path,
+            file_id=file_uuid,
+            dry_run=dry_run
+        )
+
+        # Display results
+        table = Table(title="NMR Binned Data Parse Results")
+        table.add_column("Property", style="cyan")
+        table.add_column("Value", style="green")
+
+        table.add_row("Study ID", stats.study_id or "N/A")
+        table.add_row("Analysis ID", stats.analysis_id or "N/A")
+        table.add_row("", "")
+        table.add_row("[bold]Samples[/bold]", "")
+        table.add_row("  Processed", str(stats.samples_processed))
+        table.add_row("  Created", str(stats.samples_created))
+        table.add_row("", "")
+        table.add_row("[bold]Features (NMR Bins)[/bold]", "")
+        table.add_row("  Processed", str(stats.features_processed))
+        table.add_row("  Created", str(stats.features_created))
+        table.add_row("", "")
+        table.add_row("[bold]Measurements[/bold]", "")
+        table.add_row("  Processed", str(stats.measurements_processed))
+        table.add_row("  Inserted", str(stats.measurements_inserted))
+        table.add_row("  Skipped (conflict)", str(stats.measurements_skipped))
+        table.add_row("", "")
+        table.add_row("Warnings", str(stats.warnings_count))
+        table.add_row("Mode", "Dry Run" if dry_run else "Production")
+
+        console.print(table)
+
+        if stats.warnings_count > 0:
+            console.print(f"[bold yellow]⚠ {stats.warnings_count} warnings during parsing[/bold yellow]")
+
+        if stats.measurements_skipped > 0:
+            console.print(f"[dim]Note: {stats.measurements_skipped} measurements skipped (already exist)[/dim]")
+
+        if not dry_run:
+            console.print("[bold green]✓ NMR binned data parsed and stored successfully![/bold green]")
+        else:
+            console.print("[bold blue]✓ Dry run completed - no data was written[/bold blue]")
+
+    except ValueError as e:
+        console.print(f"[bold red]✗ Validation error: {e}[/bold red]")
+        sys.exit(1)
+    except FileNotFoundError as e:
+        console.print(f"[bold red]✗ File not found: {e}[/bold red]")
+        sys.exit(1)
+    except Exception as e:
+        console.print(f"[bold red]✗ Error: {e}[/bold red]")
+        logger.exception("Error during NMR binned data parsing")
         sys.exit(1)
 
 

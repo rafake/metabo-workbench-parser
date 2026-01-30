@@ -9,6 +9,8 @@ from sqlalchemy import (
     String,
     Text,
     BigInteger,
+    Integer,
+    SmallInteger,
     Float,
     ForeignKey,
     UniqueConstraint,
@@ -129,10 +131,16 @@ class Feature(Base):
     feature_uid = Column(Text, unique=True, nullable=True)
     feature_type = Column(Text, nullable=True)
     name_raw = Column(Text, nullable=True)
+    refmet_name = Column(Text, nullable=True)
+    analysis_id = Column(Text, nullable=True)
     created_at = Column(TIMESTAMP(timezone=True), default=utc_now, nullable=False)
 
     # Relationships
     measurements = relationship("Measurement", back_populates="feature")
+
+    __table_args__ = (
+        Index("idx_feature_analysis_id", "analysis_id"),
+    )
 
 
 class Measurement(Base):
@@ -145,16 +153,23 @@ class Measurement(Base):
     feature_uid = Column(Text, ForeignKey("features.feature_uid"), nullable=True)
     value = Column(Float, nullable=True)
     unit = Column(Text, nullable=True)
+    file_id = Column(UUID(as_uuid=True), ForeignKey("files.id", ondelete="CASCADE"), nullable=True)
+    col_index = Column(Integer, nullable=True)
+    replicate_ix = Column(SmallInteger, nullable=True)
     created_at = Column(TIMESTAMP(timezone=True), default=utc_now, nullable=False)
 
     # Relationships
     sample = relationship("Sample", back_populates="measurements")
     feature = relationship("Feature", back_populates="measurements")
+    file = relationship("File")
 
     __table_args__ = (
+        # Legacy constraint for backward compatibility (when file_id is NULL)
         UniqueConstraint("sample_uid", "feature_uid", name="uq_measurement_sample_feature"),
         Index("idx_measurement_sample", "sample_uid"),
         Index("idx_measurement_feature", "feature_uid"),
+        Index("idx_measurement_file_id", "file_id"),
+        # Note: uq_measurement_file_col_feature is a partial unique index created in migration
     )
 
 
