@@ -260,6 +260,183 @@ metaloader parse mwtab <file-uuid-or-path> --dry-run
 
 **Idempotency**: Running the same file twice will update existing records (upsert), not create duplicates.
 
+### 6. Tag Files with Categories
+
+After parsing files, tag them with inferred category values for exposure, device, sample type, and platform.
+
+**Tag all files in database:**
+
+```bash
+metaloader files tag --all
+```
+
+**Tag files from specific import:**
+
+```bash
+metaloader files tag --import-id 550e8400-e29b-41d4-a716-446655440000
+```
+
+**Tag single file:**
+
+```bash
+metaloader files tag --file-id 660e9511-f3ac-52e5-b827-557766551111
+```
+
+**Dry run (preview without writing):**
+
+```bash
+metaloader files tag --all --dry-run
+```
+
+**Overwrite existing values:**
+
+```bash
+metaloader files tag --all --overwrite
+```
+
+**Example output:**
+```
+Tagging files with category values
+Tagging all files in database
+╭─────────────────────────┬──────────╮
+│ Metric                  │    Value │
+├─────────────────────────┼──────────┤
+│ Files processed         │       42 │
+│ Files updated           │       38 │
+│ Files skipped           │        4 │
+│                         │          │
+│ Tags set:               │          │
+│   Device                │       35 │
+│   Exposure              │       22 │
+│   Sample type           │       40 │
+│   Platform              │       28 │
+╰─────────────────────────┴──────────╯
+✓ Tagging complete: 38 files updated
+```
+
+**Inferred categories:**
+
+| Category | Values | Detection Logic |
+|----------|--------|-----------------|
+| **device** | `NMR`, `LCMS`, `GCMS` | Based on `detected_type` and path patterns |
+| **exposure** | `OB`, `CON` | Keywords: obese/OB, control/CON/lean |
+| **sample_type** | `Serum`, `Urine`, `Feces`, `CSF` | Keywords in path/filename |
+| **platform** | `ESI_pos`, `HILIC`, `QQQ`, etc. | Ionization, chromatography, mass analyzer patterns |
+
+### 7. Export Data to Parquet
+
+Export long-format measurement data to Parquet for analysis in R or Python.
+
+**Basic export:**
+
+```bash
+metaloader export parquet --out exports/metaloader_long.parquet
+```
+
+**Filter by import:**
+
+```bash
+metaloader export parquet --out exports/data.parquet --import-id 550e8400-e29b-41d4-a716-446655440000
+```
+
+**Filter by feature type:**
+
+```bash
+metaloader export parquet --out exports/nmr_data.parquet --feature-type nmr_bin
+```
+
+**Preview data without exporting:**
+
+```bash
+metaloader export parquet --out exports/test.parquet --preview
+```
+
+**Count rows before export:**
+
+```bash
+metaloader export parquet --out exports/test.parquet --count
+```
+
+**Example output:**
+```
+Exporting measurement data to Parquet
+Output: exports/metaloader_long.parquet
+Chunk size: 200,000
+Processing chunk 1: 200,000 rows
+Processing chunk 2: 156,348 rows
+╭───────────────────┬────────────────────────────────╮
+│ Property          │ Value                          │
+├───────────────────┼────────────────────────────────┤
+│ Output file       │ exports/metaloader_long.parquet │
+│ Total rows        │ 356,348                        │
+│ Chunks written    │ 2                              │
+│ File size         │ 12.45 MB                       │
+╰───────────────────┴────────────────────────────────╯
+✓ Export complete: 356,348 rows written to exports/metaloader_long.parquet
+```
+
+**Exported columns:**
+
+- `file_id`, `path_rel`, `detected_type` - File metadata
+- `device`, `exposure`, `sample_type`, `platform` - Category tags
+- `sample_uid`, `sample_label` - Sample identifiers
+- `feature_uid`, `feature_type`, `feature_name`, `refmet_name` - Feature info
+- `value`, `unit`, `col_index`, `replicate_ix` - Measurement data
+- `study_id`, `analysis_id` - Study/analysis references
+- `created_at` - Timestamp
+
+### Reading Parquet in R
+
+```r
+library(arrow)
+
+# Read entire file
+df <- read_parquet("metaloader_long.parquet")
+
+# Or use lazy evaluation for large files
+dataset <- open_dataset("metaloader_long.parquet")
+
+# Filter and collect
+nmr_data <- dataset |>
+  filter(device == "NMR") |>
+  collect()
+
+# Filter by exposure
+ob_samples <- dataset |>
+  filter(exposure == "OB") |>
+  select(sample_uid, feature_name, value) |>
+  collect()
+
+# Aggregate by sample type
+sample_counts <- dataset |>
+  group_by(sample_type) |>
+  summarise(n = n(), mean_value = mean(value, na.rm = TRUE)) |>
+  collect()
+```
+
+### Reading Parquet in Python
+
+```python
+import pandas as pd
+import pyarrow.parquet as pq
+
+# Read entire file
+df = pd.read_parquet("metaloader_long.parquet")
+
+# Or use PyArrow for lazy filtering
+table = pq.read_table(
+    "metaloader_long.parquet",
+    filters=[("device", "==", "NMR")]
+)
+df = table.to_pandas()
+
+# With polars (recommended for large files)
+import polars as pl
+df = pl.scan_parquet("metaloader_long.parquet") \
+    .filter(pl.col("exposure") == "OB") \
+    .collect()
+```
+
 **Check parsed data:**
 
 ```sql
@@ -404,22 +581,30 @@ src/metaloader/
 ├── services/
 │   ├── file_handler.py    # File processing logic
 │   ├── import_service.py  # Import management
-│   └── parse_service.py   # Parsing and data extraction
+│   ├── parse_service.py   # Parsing and data extraction
+│   ├── tagger_service.py  # File category tagging
+│   └── export_service.py  # Parquet export
 └── utils/
     ├── hashing.py         # SHA256 streaming
-    └── type_detector.py   # File type detection
+    ├── type_detector.py   # File type detection
+    └── tagger.py          # Category inference heuristics
 
 alembic/
 ├── env.py              # Alembic environment
 └── versions/
-    ├── 001_initial_schema.py  # Initial migration
-    ├── 002_add_sample_factors.py  # Sample factors table
-    └── 003_add_factors_raw_and_measurements_constraint.py  # Phase 2
+    ├── 001_initial_schema.py
+    ├── 002_add_sample_factors.py
+    ├── 003_add_factors_raw_and_measurements_constraint.py
+    ├── 004_add_ms_measurement_columns.py
+    ├── 005_add_category_columns.py
+    ├── 006_add_file_parse_status.py
+    └── 007_add_file_category_columns.py
 
 tests/
 ├── test_hashing.py
 ├── test_type_detector.py
-└── test_mwtab_parser.py
+├── test_mwtab_parser.py
+└── test_tagger.py
 ```
 
 ## Troubleshooting
@@ -457,7 +642,7 @@ metaloader db init
   - File ingestion with deduplication
   - Import tracking
 
-- ✅ **Phase 2**: mwTab Parsing (current)
+- ✅ **Phase 2**: mwTab Parsing
   - Parse `SUBJECT_SAMPLE_FACTORS` section
   - Parse `MS_METABOLITE_DATA` section
   - Extract study/analysis/sample metadata
@@ -465,15 +650,20 @@ metaloader db init
   - Batch upserts for performance
   - Idempotent: re-running updates existing data
 
-- 📋 **Phase 3**: Additional Formats (planned)
+- ✅ **Phase 3**: Export & Categories
+  - Category tagging: device, exposure, sample_type, platform
+  - Heuristic inference from file paths and metadata
+  - Parquet export with chunked streaming
+  - zstd compression for efficient storage
+
+- 📋 **Phase 4**: Additional Formats (planned)
   - NMR binned data parser (Excel)
   - HTML table parser
   - CSV/TSV parsers
 
-- 📋 **Phase 4**: Analysis (planned)
+- 📋 **Phase 5**: Analysis (planned)
   - Data validation
   - Quality checks
-  - Export functionality
   - Data aggregation/normalization
 
 ## Contributing

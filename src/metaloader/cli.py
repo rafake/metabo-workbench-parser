@@ -23,6 +23,8 @@ from metaloader.services.parse_nmr_service import ParseNMRService
 from metaloader.services.derive_service import DeriveService
 from metaloader.services.ingest_dir_service import IngestDirService
 from metaloader.services.parse_dir_service import ParseDirService
+from metaloader.services.tagger_service import TaggerService
+from metaloader.services.export_service import ExportService
 from metaloader.qc import QCService, QCFilters
 from metaloader.models import File
 
@@ -41,10 +43,14 @@ db_app = typer.Typer(help="Database management commands")
 parse_app = typer.Typer(help="Parse and extract data from files")
 qc_app = typer.Typer(help="Quality control and data validation commands")
 derive_app = typer.Typer(help="Derive computed columns from raw data")
+files_app = typer.Typer(help="File management and tagging commands")
+export_app = typer.Typer(help="Export data to various formats")
 app.add_typer(db_app, name="db")
 app.add_typer(parse_app, name="parse")
 app.add_typer(qc_app, name="qc")
 app.add_typer(derive_app, name="derive")
+app.add_typer(files_app, name="files")
+app.add_typer(export_app, name="export")
 
 console = Console()
 
@@ -1248,6 +1254,276 @@ def _display_parse_dir_results(stats, dry_run: bool):
         console.print("[bold blue]Dry run completed - no data was written[/bold blue]")
     else:
         console.print(f"[bold green]Bulk parsing completed - {stats.files_success:,} files parsed successfully[/bold green]")
+
+
+# =============================================================================
+# FILES COMMANDS
+# =============================================================================
+
+@files_app.command("tag")
+def files_tag(
+    import_id: Optional[str] = typer.Option(None, "--import-id", help="Tag files from this import"),
+    file_id: Optional[str] = typer.Option(None, "--file-id", help="Tag a single file by ID"),
+    all_files: bool = typer.Option(False, "--all", help="Tag all files in database"),
+    overwrite: bool = typer.Option(False, "--overwrite", help="Overwrite existing tag values"),
+    dry_run: bool = typer.Option(False, "--dry-run", help="Don't write to database, only show what would change"),
+):
+    """Tag files with inferred category values.
+
+    Automatically infers and sets the following columns on files:
+    - device: LCMS, GCMS, NMR (based on detected_type and path patterns)
+    - sample_type: Serum, Urine, Feces, CSF (based on path/filename)
+    - exposure: OB, CON (based on path/filename)
+    - platform: ESI_pos, HILIC, QQQ, etc. (based on path/filename)
+
+    Tagging is idempotent: existing values are preserved unless --overwrite is used.
+
+    Examples:
+        metaloader files tag --all
+        metaloader files tag --import-id abc123
+        metaloader files tag --file-id xyz789 --overwrite
+    """
+    console.print("[bold blue]Tagging files with category values[/bold blue]")
+
+    # Validate inputs
+    if not any([import_id, file_id, all_files]):
+        console.print("[bold red]✗ Error: Must specify --import-id, --file-id, or --all[/bold red]")
+        sys.exit(1)
+
+    if sum([bool(import_id), bool(file_id), all_files]) > 1:
+        console.print("[bold red]✗ Error: Specify only one of --import-id, --file-id, or --all[/bold red]")
+        sys.exit(1)
+
+    # Parse UUIDs
+    import_uuid: Optional[UUID] = None
+    file_uuid: Optional[UUID] = None
+
+    if import_id:
+        try:
+            import_uuid = UUID(import_id)
+        except ValueError:
+            console.print(f"[bold red]✗ Error: Invalid UUID format: {import_id}[/bold red]")
+            sys.exit(1)
+        console.print(f"[dim]Tagging files from import: {import_uuid}[/dim]")
+
+    if file_id:
+        try:
+            file_uuid = UUID(file_id)
+        except ValueError:
+            console.print(f"[bold red]✗ Error: Invalid UUID format: {file_id}[/bold red]")
+            sys.exit(1)
+        console.print(f"[dim]Tagging file: {file_uuid}[/dim]")
+
+    if all_files:
+        console.print("[dim]Tagging all files in database[/dim]")
+
+    if overwrite:
+        console.print("[bold yellow]⚠ Overwrite mode: existing values will be replaced[/bold yellow]")
+
+    if dry_run:
+        console.print("[bold yellow]⚠ Dry run mode: no data will be written[/bold yellow]")
+
+    try:
+        # Get database session
+        db = next(get_db())
+
+        # Initialize service
+        tagger_service = TaggerService(db)
+
+        # Run tagging
+        stats = tagger_service.tag_files(
+            import_id=import_uuid,
+            file_id=file_uuid,
+            tag_all=all_files,
+            overwrite=overwrite,
+            dry_run=dry_run,
+        )
+
+        # Display results
+        console.print()
+        table = Table(title="Tagging Results")
+        table.add_column("Metric", style="cyan", width=25)
+        table.add_column("Value", style="green", justify="right")
+
+        table.add_row("Files processed", f"{stats.files_processed:,}")
+        table.add_row("Files updated", f"{stats.files_updated:,}")
+        table.add_row("Files skipped", f"{stats.files_skipped:,}")
+        table.add_row("", "")
+        table.add_row("[bold]Tags set:[/bold]", "")
+        table.add_row("  Device", f"{stats.device_set:,}")
+        table.add_row("  Exposure", f"{stats.exposure_set:,}")
+        table.add_row("  Sample type", f"{stats.sample_type_set:,}")
+        table.add_row("  Platform", f"{stats.platform_set:,}")
+
+        console.print(table)
+        console.print()
+
+        # Show warnings if any
+        if stats.warnings:
+            console.print(f"[bold yellow]Warnings ({len(stats.warnings)}):[/bold yellow]")
+            for warning in stats.warnings[:10]:
+                console.print(f"  [yellow]{warning}[/yellow]")
+            if len(stats.warnings) > 10:
+                console.print(f"  [dim]... and {len(stats.warnings) - 10} more[/dim]")
+            console.print()
+
+        # Final status
+        if dry_run:
+            console.print("[bold blue]Dry run completed - no data was written[/bold blue]")
+        else:
+            console.print(f"[bold green]✓ Tagging complete: {stats.files_updated:,} files updated[/bold green]")
+
+    except ValueError as e:
+        console.print(f"[bold red]✗ Error: {e}[/bold red]")
+        sys.exit(1)
+    except Exception as e:
+        console.print(f"[bold red]✗ Error: {e}[/bold red]")
+        logger.exception("Error during file tagging")
+        sys.exit(1)
+
+
+# =============================================================================
+# EXPORT COMMANDS
+# =============================================================================
+
+@export_app.command("parquet")
+def export_parquet(
+    out: Path = typer.Option(..., "--out", help="Output Parquet file path"),
+    file_id: Optional[str] = typer.Option(None, "--file-id", help="Filter by file ID"),
+    import_id: Optional[str] = typer.Option(None, "--import-id", help="Filter by import ID"),
+    study_id: Optional[str] = typer.Option(None, "--study-id", help="Filter by study ID"),
+    feature_type: Optional[str] = typer.Option(None, "--feature-type", help="Filter by feature type (metabolite, nmr_bin, etc.)"),
+    chunk_size: int = typer.Option(200000, "--chunk-size", help="Number of rows per chunk"),
+    preview: bool = typer.Option(False, "--preview", help="Preview first 10 rows instead of exporting"),
+    count_only: bool = typer.Option(False, "--count", help="Only count rows, don't export"),
+):
+    """Export measurement data to Parquet format.
+
+    Exports long-format measurement data with file categories, sample info,
+    feature info, and measurement values. Data is streamed in chunks to
+    avoid loading the entire dataset into memory.
+
+    Output columns:
+    - file_id, path_rel, detected_type
+    - device, exposure, sample_type, platform (category tags)
+    - sample_uid, sample_label
+    - feature_uid, feature_type, feature_name, refmet_name
+    - value, unit, col_index, replicate_ix
+    - study_id, analysis_id (if available)
+    - created_at
+
+    Examples:
+        metaloader export parquet --out data.parquet
+        metaloader export parquet --out data.parquet --import-id abc123
+        metaloader export parquet --out nmr.parquet --feature-type nmr_bin
+        metaloader export parquet --out data.parquet --preview
+    """
+    console.print("[bold blue]Exporting measurement data to Parquet[/bold blue]")
+
+    # Parse UUIDs
+    file_uuid: Optional[UUID] = None
+    import_uuid: Optional[UUID] = None
+
+    if file_id:
+        try:
+            file_uuid = UUID(file_id)
+        except ValueError:
+            console.print(f"[bold red]✗ Error: Invalid UUID format for --file-id: {file_id}[/bold red]")
+            sys.exit(1)
+        console.print(f"[dim]Filtering by file: {file_uuid}[/dim]")
+
+    if import_id:
+        try:
+            import_uuid = UUID(import_id)
+        except ValueError:
+            console.print(f"[bold red]✗ Error: Invalid UUID format for --import-id: {import_id}[/bold red]")
+            sys.exit(1)
+        console.print(f"[dim]Filtering by import: {import_uuid}[/dim]")
+
+    if study_id:
+        console.print(f"[dim]Filtering by study: {study_id}[/dim]")
+
+    if feature_type:
+        console.print(f"[dim]Filtering by feature type: {feature_type}[/dim]")
+
+    try:
+        # Initialize export service with engine
+        export_service = ExportService(engine)
+
+        # Count only mode
+        if count_only:
+            console.print("[dim]Counting rows...[/dim]")
+            row_count = export_service.get_row_count(
+                file_id=file_uuid,
+                import_id=import_uuid,
+                feature_type=feature_type,
+                study_id=study_id,
+            )
+            console.print(f"[bold green]Total rows: {row_count:,}[/bold green]")
+            return
+
+        # Preview mode
+        if preview:
+            console.print("[dim]Fetching preview...[/dim]")
+            preview_df = export_service.get_export_preview(
+                file_id=file_uuid,
+                import_id=import_uuid,
+                feature_type=feature_type,
+                study_id=study_id,
+                limit=10,
+            )
+
+            if preview_df.empty:
+                console.print("[bold yellow]No data found matching filters[/bold yellow]")
+                return
+
+            # Display preview as table
+            table = Table(title="Export Preview (first 10 rows)")
+            for col in preview_df.columns:
+                table.add_column(col, style="cyan", overflow="fold", max_width=20)
+
+            for _, row in preview_df.iterrows():
+                table.add_row(*[str(v) if v is not None else "NULL" for v in row.values])
+
+            console.print(table)
+            console.print(f"[dim]Showing {len(preview_df)} of potentially many more rows[/dim]")
+            return
+
+        # Full export
+        console.print(f"[dim]Output: {out}[/dim]")
+        console.print(f"[dim]Chunk size: {chunk_size:,}[/dim]")
+
+        stats = export_service.export_parquet(
+            output_path=out,
+            file_id=file_uuid,
+            import_id=import_uuid,
+            feature_type=feature_type,
+            study_id=study_id,
+            chunk_size=chunk_size,
+        )
+
+        # Display results
+        console.print()
+        table = Table(title="Export Results")
+        table.add_column("Property", style="cyan")
+        table.add_column("Value", style="green")
+
+        table.add_row("Output file", stats.output_path)
+        table.add_row("Total rows", f"{stats.total_rows:,}")
+        table.add_row("Chunks written", f"{stats.total_chunks:,}")
+        table.add_row("File size", f"{stats.file_size_bytes / (1024*1024):.2f} MB")
+
+        console.print(table)
+
+        if stats.total_rows == 0:
+            console.print("[bold yellow]⚠ No data exported - check your filters[/bold yellow]")
+        else:
+            console.print(f"[bold green]✓ Export complete: {stats.total_rows:,} rows written to {out}[/bold green]")
+
+    except Exception as e:
+        console.print(f"[bold red]✗ Error: {e}[/bold red]")
+        logger.exception("Error during Parquet export")
+        sys.exit(1)
 
 
 if __name__ == "__main__":

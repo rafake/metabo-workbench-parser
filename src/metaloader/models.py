@@ -64,6 +64,9 @@ class File(Base):
     sha256 = Column(String(64), nullable=False)
     detected_type = Column(Text, nullable=False)
     device = Column(Text, nullable=True)  # LCMS, GCMS, NMR, MS, NULL
+    exposure = Column(Text, nullable=True)  # OB, CON, NULL
+    sample_type = Column(Text, nullable=True)  # Serum, Urine, Feces, CSF, NULL
+    platform = Column(Text, nullable=True)  # ESI_pos, ESI_neg, HILIC, QQQ, QTOF, etc.
     parse_status = Column(Text, nullable=False, default="pending")  # pending, success, failed, skipped
     parse_error = Column(Text, nullable=True)
     parsed_at = Column(TIMESTAMP(timezone=True), nullable=True)
@@ -76,6 +79,10 @@ class File(Base):
         UniqueConstraint("sha256", "size_bytes", name="uq_file_sha256_size"),
         Index("idx_file_sha256", "sha256"),
         Index("idx_files_device", "device"),
+        Index("idx_files_exposure", "exposure"),
+        Index("idx_files_sample_type", "sample_type"),
+        Index("idx_files_platform", "platform"),
+        Index("idx_files_detected_type", "detected_type"),
         Index("idx_files_parse_status", "parse_status"),
         CheckConstraint(
             "parse_status IN ('pending', 'success', 'failed', 'skipped')",
