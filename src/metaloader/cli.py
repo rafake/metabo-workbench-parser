@@ -20,6 +20,9 @@ from metaloader.services.import_service import ImportService
 from metaloader.services.parse_service import ParseService
 from metaloader.services.parse_ms_service import ParseMSService
 from metaloader.services.parse_nmr_service import ParseNMRService
+from metaloader.services.derive_service import DeriveService
+from metaloader.services.ingest_dir_service import IngestDirService
+from metaloader.services.parse_dir_service import ParseDirService
 from metaloader.qc import QCService, QCFilters
 from metaloader.models import File
 
@@ -37,9 +40,11 @@ app = typer.Typer(help="Metaloader - Tool for loading metabolomics data into Pos
 db_app = typer.Typer(help="Database management commands")
 parse_app = typer.Typer(help="Parse and extract data from files")
 qc_app = typer.Typer(help="Quality control and data validation commands")
+derive_app = typer.Typer(help="Derive computed columns from raw data")
 app.add_typer(db_app, name="db")
 app.add_typer(parse_app, name="parse")
 app.add_typer(qc_app, name="qc")
+app.add_typer(derive_app, name="derive")
 
 console = Console()
 
@@ -783,6 +788,466 @@ def qc_summary(
         console.print(f"[bold red]✗ Error running QC: {e}[/bold red]")
         logger.exception("Error during QC summary")
         sys.exit(1)
+
+
+@derive_app.command("categories")
+def derive_categories(
+    study_id: Optional[str] = typer.Option(None, "--study-id", help="Filter by study ID (e.g., ST000106)"),
+    file_id: Optional[str] = typer.Option(None, "--file-id", help="UUID of specific file to process"),
+    dry_run: bool = typer.Option(False, "--dry-run", help="Don't write to database, only show what would change"),
+    limit: Optional[int] = typer.Option(None, "--limit", help="Limit number of records to process"),
+):
+    """Derive category columns from raw data.
+
+    This command computes and stores:
+    - files.device: LCMS, GCMS, NMR, MS (from file content/metadata)
+    - samples.exposure: OB, CON (from sample factors)
+    - samples.sample_matrix: Serum, Urine, Feces, CSF (from sample factors or file paths)
+
+    The operation is idempotent - running multiple times won't duplicate data.
+    """
+    console.print("[bold blue]Deriving category columns...[/bold blue]")
+
+    # Show applied filters
+    if study_id:
+        console.print(f"[dim]Filter: study_id = {study_id}[/dim]")
+    if file_id:
+        console.print(f"[dim]Filter: file_id = {file_id}[/dim]")
+    if limit:
+        console.print(f"[dim]Limit: {limit} records[/dim]")
+    if dry_run:
+        console.print("[bold yellow]⚠ Dry run mode - no changes will be saved[/bold yellow]")
+
+    # Parse file_id if provided
+    file_uuid: Optional[UUID] = None
+    if file_id:
+        try:
+            file_uuid = UUID(file_id)
+        except ValueError:
+            console.print(f"[bold red]✗ Error: Invalid UUID format: {file_id}[/bold red]")
+            sys.exit(1)
+
+    try:
+        # Get database session
+        db = next(get_db())
+
+        # Initialize service
+        derive_service = DeriveService(db)
+
+        # Run derivation
+        stats = derive_service.derive_all(
+            study_id=study_id,
+            file_id=file_uuid,
+            dry_run=dry_run,
+            limit=limit
+        )
+
+        # Display results
+        console.print()
+
+        # === Device stats table ===
+        device_table = Table(title="Device Derivation (files)", show_header=True, header_style="bold cyan")
+        device_table.add_column("Metric", style="cyan", width=30)
+        device_table.add_column("Count", style="green", justify="right")
+
+        device_table.add_row("Files processed", f"{stats.files_processed:,}")
+        device_table.add_row("Device set", f"{stats.files_device_set:,}")
+        device_table.add_row("Already had device", f"{stats.files_device_already_set:,}")
+        device_table.add_row("Could not determine", f"{stats.files_device_unknown:,}")
+
+        console.print(device_table)
+        console.print()
+
+        # === Exposure stats table ===
+        exposure_table = Table(title="Exposure Derivation (samples)", show_header=True, header_style="bold cyan")
+        exposure_table.add_column("Metric", style="cyan", width=30)
+        exposure_table.add_column("Count", style="green", justify="right")
+
+        exposure_table.add_row("Samples processed", f"{stats.samples_processed:,}")
+        exposure_table.add_row("Exposure set", f"{stats.samples_exposure_set:,}")
+        exposure_table.add_row("Already had exposure", f"{stats.samples_exposure_already_set:,}")
+        exposure_table.add_row("Could not determine", f"{stats.samples_exposure_unknown:,}")
+        if stats.samples_exposure_conflict > 0:
+            exposure_table.add_row("[yellow]Conflicts (warning)[/yellow]", f"[yellow]{stats.samples_exposure_conflict:,}[/yellow]")
+
+        console.print(exposure_table)
+        console.print()
+
+        # === Matrix stats table ===
+        matrix_table = Table(title="Sample Matrix Derivation (samples)", show_header=True, header_style="bold cyan")
+        matrix_table.add_column("Metric", style="cyan", width=30)
+        matrix_table.add_column("Count", style="green", justify="right")
+
+        matrix_table.add_row("Matrix set", f"{stats.samples_matrix_set:,}")
+        matrix_table.add_row("Already had matrix", f"{stats.samples_matrix_already_set:,}")
+        matrix_table.add_row("Could not determine", f"{stats.samples_matrix_unknown:,}")
+        if stats.samples_matrix_conflict > 0:
+            matrix_table.add_row("[yellow]Conflicts (warning)[/yellow]", f"[yellow]{stats.samples_matrix_conflict:,}[/yellow]")
+
+        console.print(matrix_table)
+        console.print()
+
+        # Show warnings if any
+        if stats.warnings:
+            console.print(f"[bold yellow]⚠ {len(stats.warnings)} warnings:[/bold yellow]")
+            for warning in stats.warnings[:10]:  # Show first 10
+                console.print(f"  [yellow]• {warning}[/yellow]")
+            if len(stats.warnings) > 10:
+                console.print(f"  [dim]... and {len(stats.warnings) - 10} more[/dim]")
+            console.print()
+
+        # Final status
+        if dry_run:
+            console.print("[bold blue]✓ Dry run completed - no data was written[/bold blue]")
+        else:
+            total_set = stats.files_device_set + stats.samples_exposure_set + stats.samples_matrix_set
+            console.print(f"[bold green]✓ Category derivation completed - {total_set:,} values set[/bold green]")
+
+    except Exception as e:
+        console.print(f"[bold red]✗ Error during derivation: {e}[/bold red]")
+        logger.exception("Error during category derivation")
+        sys.exit(1)
+
+
+@app.command("ingest-dir")
+def ingest_dir(
+    directory: Path = typer.Argument(..., help="Directory to ingest recursively"),
+    import_notes: Optional[str] = typer.Option(None, "--import-notes", help="Notes for the import record"),
+    include_extensions: Optional[str] = typer.Option(
+        None, "--include-extensions",
+        help="Comma-separated list of extensions to include (e.g., '.txt,.csv')"
+    ),
+    max_files: Optional[int] = typer.Option(None, "--max-files", help="Maximum number of files to process"),
+    dry_run: bool = typer.Option(False, "--dry-run", help="Don't write to database, only show what would be ingested"),
+):
+    """Ingest all files from a directory recursively.
+
+    Scans the directory recursively and registers all files with supported extensions
+    in the database. Files are deduplicated by SHA256+size.
+
+    Default extensions: .txt, .htm, .html, .csv, .tsv, .xlsx, .xlsm, .zip, .pdf
+    """
+    console.print(f"[bold blue]Ingesting directory: {directory}[/bold blue]")
+
+    # Validate directory
+    if not directory.exists():
+        console.print(f"[bold red]✗ Error: Directory not found: {directory}[/bold red]")
+        sys.exit(1)
+
+    if not directory.is_dir():
+        console.print(f"[bold red]✗ Error: Path is not a directory: {directory}[/bold red]")
+        sys.exit(1)
+
+    directory = directory.absolute()
+
+    # Parse extensions
+    extensions = None
+    if include_extensions:
+        extensions = {ext.strip() for ext in include_extensions.split(",")}
+        console.print(f"[dim]Extensions: {', '.join(sorted(extensions))}[/dim]")
+
+    if max_files:
+        console.print(f"[dim]Max files: {max_files}[/dim]")
+
+    if dry_run:
+        console.print("[bold yellow]Dry run mode - no data will be written[/bold yellow]")
+
+    try:
+        # Get database session
+        db = next(get_db())
+
+        # Initialize service
+        ingest_service = IngestDirService(db)
+
+        # Run ingestion
+        stats = ingest_service.ingest_directory(
+            directory=directory,
+            import_notes=import_notes,
+            include_extensions=extensions,
+            max_files=max_files,
+            dry_run=dry_run,
+        )
+
+        # Display results
+        console.print()
+
+        # Main stats table
+        table = Table(title="Directory Ingestion Results")
+        table.add_column("Metric", style="cyan", width=25)
+        table.add_column("Value", style="green", justify="right")
+
+        if stats.import_id:
+            table.add_row("Import ID", str(stats.import_id))
+        table.add_row("Root Path", stats.root_path)
+        table.add_row("", "")
+        table.add_row("Files found", f"{stats.files_found:,}")
+        table.add_row("Files processed", f"{stats.files_processed:,}")
+        table.add_row("  New", f"{stats.files_new:,}")
+        table.add_row("  Duplicate", f"{stats.files_duplicate:,}")
+        table.add_row("  Skipped", f"{stats.files_skipped:,}")
+        table.add_row("  Errors", f"{stats.files_error:,}")
+
+        console.print(table)
+        console.print()
+
+        # Type distribution
+        if stats.by_type:
+            type_table = Table(title="Files by Detected Type")
+            type_table.add_column("Type", style="cyan")
+            type_table.add_column("Count", style="green", justify="right")
+            for dtype, count in sorted(stats.by_type.items(), key=lambda x: -x[1]):
+                type_table.add_row(dtype, f"{count:,}")
+            console.print(type_table)
+            console.print()
+
+        # Extension distribution
+        if stats.by_extension:
+            ext_table = Table(title="Files by Extension")
+            ext_table.add_column("Extension", style="cyan")
+            ext_table.add_column("Count", style="green", justify="right")
+            for ext, count in sorted(stats.by_extension.items(), key=lambda x: -x[1]):
+                ext_table.add_row(ext, f"{count:,}")
+            console.print(ext_table)
+            console.print()
+
+        # Show errors if any
+        if stats.errors:
+            console.print(f"[bold yellow]Errors ({len(stats.errors)}):[/bold yellow]")
+            for error in stats.errors[:10]:
+                console.print(f"  [yellow]{error}[/yellow]")
+            if len(stats.errors) > 10:
+                console.print(f"  [dim]... and {len(stats.errors) - 10} more[/dim]")
+            console.print()
+
+        # Final status
+        if dry_run:
+            console.print("[bold blue]Dry run completed - no data was written[/bold blue]")
+        else:
+            console.print(f"[bold green]Directory ingestion completed - {stats.files_new:,} new files ingested[/bold green]")
+
+    except ValueError as e:
+        console.print(f"[bold red]✗ Error: {e}[/bold red]")
+        sys.exit(1)
+    except Exception as e:
+        console.print(f"[bold red]✗ Error: {e}[/bold red]")
+        logger.exception("Error during directory ingestion")
+        sys.exit(1)
+
+
+@app.command("parse-dir")
+def parse_dir(
+    directory: Path = typer.Argument(..., help="Directory to parse recursively"),
+    only_types: Optional[str] = typer.Option(
+        None, "--only-types",
+        help="Only parse these detected types (comma-separated, e.g., 'mwtab,mwtab_ms')"
+    ),
+    skip_types: Optional[str] = typer.Option(
+        None, "--skip-types",
+        help="Skip these detected types (comma-separated)"
+    ),
+    fail_fast: bool = typer.Option(False, "--fail-fast", help="Stop on first error"),
+    max_files: Optional[int] = typer.Option(None, "--max-files", help="Maximum number of files to parse"),
+    dry_run: bool = typer.Option(False, "--dry-run", help="Don't write to database, only show what would be parsed"),
+):
+    """Parse all supported files in a directory recursively.
+
+    Scans the directory for parsable files and extracts their data.
+    Supported types: mwtab, mwtab_ms, mwtab_nmr_binned
+    """
+    console.print(f"[bold blue]Parsing directory: {directory}[/bold blue]")
+
+    # Validate directory
+    if not directory.exists():
+        console.print(f"[bold red]✗ Error: Directory not found: {directory}[/bold red]")
+        sys.exit(1)
+
+    if not directory.is_dir():
+        console.print(f"[bold red]✗ Error: Path is not a directory: {directory}[/bold red]")
+        sys.exit(1)
+
+    directory = directory.absolute()
+
+    # Parse type filters
+    only_types_set = None
+    skip_types_set = None
+
+    if only_types:
+        only_types_set = {t.strip() for t in only_types.split(",")}
+        console.print(f"[dim]Only types: {', '.join(sorted(only_types_set))}[/dim]")
+
+    if skip_types:
+        skip_types_set = {t.strip() for t in skip_types.split(",")}
+        console.print(f"[dim]Skip types: {', '.join(sorted(skip_types_set))}[/dim]")
+
+    if max_files:
+        console.print(f"[dim]Max files: {max_files}[/dim]")
+
+    if fail_fast:
+        console.print("[dim]Fail fast mode enabled[/dim]")
+
+    if dry_run:
+        console.print("[bold yellow]Dry run mode - no data will be written[/bold yellow]")
+
+    try:
+        # Get database session
+        db = next(get_db())
+
+        # Initialize service
+        parse_service = ParseDirService(db)
+
+        # Run parsing
+        stats = parse_service.parse_directory(
+            directory=directory,
+            only_types=only_types_set,
+            skip_types=skip_types_set,
+            fail_fast=fail_fast,
+            max_files=max_files,
+            dry_run=dry_run,
+        )
+
+        # Display results
+        _display_parse_dir_results(stats, dry_run)
+
+    except ValueError as e:
+        console.print(f"[bold red]✗ Error: {e}[/bold red]")
+        sys.exit(1)
+    except RuntimeError as e:
+        console.print(f"[bold red]✗ Error (fail-fast): {e}[/bold red]")
+        sys.exit(1)
+    except Exception as e:
+        console.print(f"[bold red]✗ Error: {e}[/bold red]")
+        logger.exception("Error during directory parsing")
+        sys.exit(1)
+
+
+@app.command("parse-import")
+def parse_import(
+    import_id: str = typer.Argument(..., help="UUID of the import to parse"),
+    only_types: Optional[str] = typer.Option(
+        None, "--only-types",
+        help="Only parse these detected types (comma-separated, e.g., 'mwtab,mwtab_ms')"
+    ),
+    skip_types: Optional[str] = typer.Option(
+        None, "--skip-types",
+        help="Skip these detected types (comma-separated)"
+    ),
+    fail_fast: bool = typer.Option(False, "--fail-fast", help="Stop on first error"),
+    max_files: Optional[int] = typer.Option(None, "--max-files", help="Maximum number of files to parse"),
+    dry_run: bool = typer.Option(False, "--dry-run", help="Don't write to database, only show what would be parsed"),
+):
+    """Parse all pending files from an import.
+
+    Parses files with parse_status='pending' or 'failed' from the specified import.
+    Updates parse_status to 'success' or 'failed' after processing.
+    """
+    console.print(f"[bold blue]Parsing import: {import_id}[/bold blue]")
+
+    # Validate UUID
+    try:
+        import_uuid = UUID(import_id)
+    except ValueError:
+        console.print(f"[bold red]✗ Error: Invalid UUID format: {import_id}[/bold red]")
+        sys.exit(1)
+
+    # Parse type filters
+    only_types_set = None
+    skip_types_set = None
+
+    if only_types:
+        only_types_set = {t.strip() for t in only_types.split(",")}
+        console.print(f"[dim]Only types: {', '.join(sorted(only_types_set))}[/dim]")
+
+    if skip_types:
+        skip_types_set = {t.strip() for t in skip_types.split(",")}
+        console.print(f"[dim]Skip types: {', '.join(sorted(skip_types_set))}[/dim]")
+
+    if max_files:
+        console.print(f"[dim]Max files: {max_files}[/dim]")
+
+    if fail_fast:
+        console.print("[dim]Fail fast mode enabled[/dim]")
+
+    if dry_run:
+        console.print("[bold yellow]Dry run mode - no data will be written[/bold yellow]")
+
+    try:
+        # Get database session
+        db = next(get_db())
+
+        # Initialize service
+        parse_service = ParseDirService(db)
+
+        # Run parsing
+        stats = parse_service.parse_import(
+            import_id=import_uuid,
+            only_types=only_types_set,
+            skip_types=skip_types_set,
+            fail_fast=fail_fast,
+            max_files=max_files,
+            dry_run=dry_run,
+        )
+
+        # Display results
+        _display_parse_dir_results(stats, dry_run)
+
+    except ValueError as e:
+        console.print(f"[bold red]✗ Error: {e}[/bold red]")
+        sys.exit(1)
+    except RuntimeError as e:
+        console.print(f"[bold red]✗ Error (fail-fast): {e}[/bold red]")
+        sys.exit(1)
+    except Exception as e:
+        console.print(f"[bold red]✗ Error: {e}[/bold red]")
+        logger.exception("Error during import parsing")
+        sys.exit(1)
+
+
+def _display_parse_dir_results(stats, dry_run: bool):
+    """Display bulk parsing results."""
+    console.print()
+
+    # Main stats table
+    table = Table(title="Bulk Parse Results")
+    table.add_column("Metric", style="cyan", width=25)
+    table.add_column("Value", style="green", justify="right")
+
+    table.add_row("Files total", f"{stats.files_total:,}")
+    table.add_row("Files parsed", f"{stats.files_parsed:,}")
+    table.add_row("  Success", f"{stats.files_success:,}")
+    table.add_row("  Failed", f"{stats.files_failed:,}")
+    table.add_row("  Skipped", f"{stats.files_skipped:,}")
+    table.add_row("", "")
+    table.add_row("Samples created", f"{stats.samples_created:,}")
+    table.add_row("Features created", f"{stats.features_created:,}")
+    table.add_row("Measurements inserted", f"{stats.measurements_inserted:,}")
+
+    console.print(table)
+    console.print()
+
+    # Type distribution
+    if stats.by_type:
+        type_table = Table(title="Parsed by Type")
+        type_table.add_column("Type", style="cyan")
+        type_table.add_column("Count", style="green", justify="right")
+        for dtype, count in sorted(stats.by_type.items(), key=lambda x: -x[1]):
+            type_table.add_row(dtype, f"{count:,}")
+        console.print(type_table)
+        console.print()
+
+    # Show errors if any
+    if stats.errors:
+        console.print(f"[bold yellow]Errors ({len(stats.errors)}):[/bold yellow]")
+        for error in stats.errors[:10]:
+            console.print(f"  [yellow]{error}[/yellow]")
+        if len(stats.errors) > 10:
+            console.print(f"  [dim]... and {len(stats.errors) - 10} more[/dim]")
+        console.print()
+
+    # Final status
+    if dry_run:
+        console.print("[bold blue]Dry run completed - no data was written[/bold blue]")
+    else:
+        console.print(f"[bold green]Bulk parsing completed - {stats.files_success:,} files parsed successfully[/bold green]")
 
 
 if __name__ == "__main__":

@@ -63,6 +63,10 @@ class File(Base):
     size_bytes = Column(BigInteger, nullable=False)
     sha256 = Column(String(64), nullable=False)
     detected_type = Column(Text, nullable=False)
+    device = Column(Text, nullable=True)  # LCMS, GCMS, NMR, MS, NULL
+    parse_status = Column(Text, nullable=False, default="pending")  # pending, success, failed, skipped
+    parse_error = Column(Text, nullable=True)
+    parsed_at = Column(TIMESTAMP(timezone=True), nullable=True)
     created_at = Column(TIMESTAMP(timezone=True), default=utc_now, nullable=False)
 
     # Relationships
@@ -71,6 +75,12 @@ class File(Base):
     __table_args__ = (
         UniqueConstraint("sha256", "size_bytes", name="uq_file_sha256_size"),
         Index("idx_file_sha256", "sha256"),
+        Index("idx_files_device", "device"),
+        Index("idx_files_parse_status", "parse_status"),
+        CheckConstraint(
+            "parse_status IN ('pending', 'success', 'failed', 'skipped')",
+            name="ck_files_parse_status"
+        ),
     )
 
 
@@ -97,11 +107,16 @@ class Analysis(Base):
     study_pk = Column(UUID(as_uuid=True), ForeignKey("studies.id"), nullable=True)
     analysis_id = Column(Text, nullable=True)
     file_id = Column(UUID(as_uuid=True), ForeignKey("files.id", ondelete="SET NULL"), nullable=True)
+    device = Column(Text, nullable=True)  # LCMS, GCMS, NMR, MS, NULL
     created_at = Column(TIMESTAMP(timezone=True), default=utc_now, nullable=False)
 
     # Relationships
     study = relationship("Study", back_populates="analyses")
     file = relationship("File")
+
+    __table_args__ = (
+        Index("idx_analyses_device", "device"),
+    )
 
 
 class Sample(Base):
@@ -114,12 +129,19 @@ class Sample(Base):
     sample_label = Column(Text, nullable=True)
     sample_uid = Column(Text, unique=True, nullable=True)
     factors_raw = Column(Text, nullable=True)
+    exposure = Column(Text, nullable=True)  # OB, CON, NULL
+    sample_matrix = Column(Text, nullable=True)  # Serum, Urine, Feces, CSF, NULL
     created_at = Column(TIMESTAMP(timezone=True), default=utc_now, nullable=False)
 
     # Relationships
     study = relationship("Study", back_populates="samples")
     measurements = relationship("Measurement", back_populates="sample")
     factors = relationship("SampleFactor", back_populates="sample", cascade="all, delete-orphan")
+
+    __table_args__ = (
+        Index("idx_samples_exposure", "exposure"),
+        Index("idx_samples_sample_matrix", "sample_matrix"),
+    )
 
 
 class Feature(Base):
